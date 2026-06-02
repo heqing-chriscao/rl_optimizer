@@ -22,6 +22,7 @@ from modules.mutator  import RandomMutator
 from modules.scorer   import PairwiseScorer
 from modules.updater  import SPSAUpdater
 from modules.docking  import DockingFeatureExtractor, generate_all_kmers
+from modules.env      import AptamerEnv
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -59,6 +60,9 @@ class OptimizerConfig:
     # If the file exists it is loaded; if not, all k-mers are preloaded and saved there.
     # Set to '' to disable (use lazy per-sequence loading instead).
     cache_path: str = ''
+
+    # RL environment
+    history_length: int = 5   # number of (sequence, rank) pairs kept in AptamerState
 
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -131,6 +135,16 @@ class SPSAOptimizer:
                 self.feature_extractor.preload_all(k)
                 self.feature_extractor.save_cache(cfg.cache_path)
 
+        # ── RL Environment (built from cache; holds full ranking table) ────────
+        self.env = AptamerEnv(
+            feature_extractor=self.feature_extractor,
+            protein_weights=cfg.protein_weights,
+            n_targets=len(cfg.target_protein_names),
+            seq_length=len(cfg.initial_sequence),
+            full_batch_size=cfg.num_internal_reps + 2,
+            history_length=cfg.history_length,
+        )
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run(self) -> pd.DataFrame:
@@ -138,32 +152,61 @@ class SPSAOptimizer:
         np.random.seed(0)
         cfg = self.cfg
 
-        current_seq = cfg.initial_sequence
+        state = self.env.reset(cfg.initial_sequence)
         self.history.append({
             'iteration':  0,
-            'aptamer_seq': current_seq,
+            'aptamer_seq': state.current_seq,
             'score':       np.nan,
+            'rank':        state.current_rank,
+            'reward':      np.nan,
             'update_type': 'initial',
         })
 
+        # ── DEBUG helpers (remove with debug blocks below) ────────────────────
+        _NTS = ['A', 'C', 'G', 'T']
+        _L   = len(cfg.initial_sequence)
+        _N   = cfg.num_internal_reps
+        def _dec(row):
+            seq = ''.join(_NTS[np.argmax(row[4*i:4*i+4])] for i in range(_L))
+            return seq, float(row[-1])
+        def _slot(i):
+            return 'smart  ' if i == _N else 'current' if i == _N+1 else f'dumb {i:02d}'
+        # ── END DEBUG helpers ─────────────────────────────────────────────────
+
         for t in range(1, cfg.max_iterations + 1):
-            print(f"\n── Iteration {t}/{cfg.max_iterations}  current: {current_seq} ──")
+            print(f"\n── Iteration {t}/{cfg.max_iterations}  "
+                  f"current: {state.current_seq}  rank: {state.current_rank} ──")
 
             # ── Block 1: generate dumb candidates ─────────────────────────────
             dumb_candidates = self.mutator.generate_candidates(
-                current_seq, cfg.num_internal_reps
+                state, cfg.num_internal_reps
             )
 
             # ── Score batch-1 [current + dumb] to obtain current_score ────────
-            batch1_seqs   = [current_seq] + dumb_candidates
+            batch1_seqs   = [state.current_seq] + dumb_candidates
             batch1_scores = self._effective_scores(batch1_seqs)
             current_score = batch1_scores[0]
             dumb_scores   = batch1_scores[1:]
 
+            # ── DEBUG: per-protein pairwise scores for batch-1 ────────────────
+            _b1_labels = ['current'] + [f'dumb_{i:02d}' for i in range(len(dumb_candidates))]
+            self._debug_pairwise(batch1_seqs, _b1_labels, 'pairwise batch-1 (before smart)',
+                                 show=[0, 1, 2, 3])   # current + first 3 dumb
+            # ── END DEBUG ─────────────────────────────────────────────────────
+
+            # ── Partially update obs: dumb candidates + current, smart = zeros ─
+            state = self.env.observe(state, dumb_candidates, dumb_scores, current_score)
+
+            # ── DEBUG: partial obs (smart slot = zeros) ───────────────────────
+            print("   [DEBUG] obs[-1] before smart (smart slot zeros):")
+            for _i, _row in enumerate(state.obs[-1]):
+                _seq, _sc = _dec(_row)
+                print(f"     [{_slot(_i)}] {_seq}  score={_sc:.6f}")
+            # ── END DEBUG ─────────────────────────────────────────────────────
 
             # ── Block 3: produce smart candidate ──────────────────────────────
             smart_candidate = self.updater.compute_update(
-                current_seq=current_seq,
+                state=state,
                 candidates=dumb_candidates,
                 candidate_scores=dumb_scores,
                 current_score=current_score,
@@ -171,14 +214,19 @@ class SPSAOptimizer:
 
             # ── Score full batch [dumb + smart + current] ─────────────────────
             # Indices: 0..N-1 = dumb, N = smart, N+1 = current
-            full_batch    = dumb_candidates + [smart_candidate, current_seq]
+            full_batch    = dumb_candidates + [smart_candidate, state.current_seq]
             all_scores    = self._effective_scores(full_batch)  # [N+2]
 
             best_idx  = int(np.argmin(all_scores))
             best_seq  = full_batch[best_idx]
             best_score = float(all_scores[best_idx])
 
+            # ── DEBUG: per-protein pairwise scores for full batch ─────────────
             N = cfg.num_internal_reps
+            _fb_labels = [f'dumb_{i:02d}' for i in range(N)] + ['smart', 'current']
+            self._debug_pairwise(full_batch, _fb_labels, 'pairwise full-batch (after smart)',
+                                 show=[0, 1, 2, -2, -1])  # first 3 dumb + smart + current
+            # ── END DEBUG ─────────────────────────────────────────────────────
             if best_idx < N:
                 update_type = 'dumb'
             elif best_idx == N:
@@ -186,15 +234,25 @@ class SPSAOptimizer:
             else:
                 update_type = 'no_update'
 
+            # ── RL step: fill smart slot, advance state, compute reward ──────
+            state, reward = self.env.step(state, best_seq, full_batch, all_scores)
 
-            print(f"   {update_type}: {current_seq} -> {best_seq}  "
-                  f"(score {best_score:.4f})")
+            # ── DEBUG: complete obs (smart slot filled) ───────────────────────
+            print("   [DEBUG] obs[-1] after smart (complete):")
+            for _i, _row in enumerate(state.obs[-1]):
+                _seq, _sc = _dec(_row)
+                print(f"     [{_slot(_i)}] {_seq}  score={_sc:.6f}")
+            # ── END DEBUG ─────────────────────────────────────────────────────
 
-            current_seq = best_seq
+            print(f"   {update_type}: {full_batch[-1]} -> {best_seq}  "
+                  f"(score {best_score:.4f}  rank {state.current_rank}  reward {reward:+.0f})")
+
             self.history.append({
                 'iteration':  t,
-                'aptamer_seq': current_seq,
+                'aptamer_seq': state.current_seq,
                 'score':       best_score,
+                'rank':        state.current_rank,
+                'reward':      reward,
                 'update_type': update_type,
             })
 
@@ -204,6 +262,53 @@ class SPSAOptimizer:
         return pd.DataFrame(self.history)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _debug_pairwise(self, seqs: List[str], labels: List[str], title: str, show: List[int]) -> None:
+        """Print energy matrix, raw pairwise sub-matrices, and aggregated per-protein scores."""
+        from modules.pairwise import compute_fakeml_pairwise_matrix
+        from modules.scorer import _aggregate_pairwise_to_scores
+        energy   = self.feature_extractor.get_energy_matrix(seqs)
+        pairwise = compute_fakeml_pairwise_matrix(energy)
+        per_prot = _aggregate_pairwise_to_scores(pairwise)
+        n        = len(seqs)
+        pnames   = self.cfg.target_protein_names + self.cfg.counter_protein_names
+        show_idx = sorted(i % n for i in show)
+        shown_labels = [labels[i] for i in show_idx]
+        W = 10  # column width
+
+        def _gap(idx):
+            prev = -1
+            for i in idx:
+                if i > prev + 1:
+                    print(f"     {'...':>{W}}")
+                yield i
+                prev = i
+            if idx[-1] < n - 1:
+                print(f"     {'...':>{W}}")
+
+        print(f"   [DEBUG] {title} (n={n}, showing {len(show_idx)} rows):")
+
+        # ── Energy matrix ──────────────────────────────────────────────────────
+        print(f"     [Energy]")
+        print("     " + f"{'':>{W}}" + "".join(f"  {p[:W]:>{W}}" for p in pnames))
+        for i in _gap(show_idx):
+            vals = "".join(f"  {energy[i, p]:>{W}.4f}" for p in range(len(pnames)))
+            print(f"     {labels[i]:>{W}}{vals}")
+
+        # ── Pairwise sub-matrix (selected × selected), one table per protein ──
+        for p, pname in enumerate(pnames):
+            print(f"     [Pairwise — {pname}]  (+1 = row worse, -1 = row better)")
+            print("     " + f"{'':>{W}}" + "".join(f"  {lbl[:W]:>{W}}" for lbl in shown_labels))
+            for i in _gap(show_idx):
+                row = "".join(f"  {int(pairwise[i, p, j, p]):>+{W}d}" for j in show_idx)
+                print(f"     {labels[i]:>{W}}{row}")
+
+        # ── Per-protein aggregated scores (row-sum / (n-1)) ───────────────────
+        print(f"     [Per-protein scores  row-sum/(n-1)]")
+        print("     " + f"{'':>{W}}" + "".join(f"  {p[:W]:>{W}}" for p in pnames))
+        for i in _gap(show_idx):
+            vals = "".join(f"  {per_prot[i, p]:>{W}.4f}" for p in range(len(pnames)))
+            print(f"     {labels[i]:>{W}}{vals}")
 
     def _effective_scores(self, sequences: List[str]) -> np.ndarray:
         """

@@ -7,20 +7,21 @@ NN REPLACEMENT POINT
 Replace `SPSAUpdater.compute_update` with a learned policy.
 The interface is:
     compute_update(
-        current_seq     : str,
-        candidates      : List[str],   # dumb perturbations only
-        candidate_scores: np.ndarray,  # effective score for each candidate
+        state           : AptamerState,  # sliding-window history of (seq, rank) pairs
+        candidates      : List[str],     # dumb perturbations only
+        candidate_scores: np.ndarray,    # effective score for each candidate
         current_score   : float,
     ) -> str   # proposed new sequence
 
-A RL policy would receive the same inputs and output a sequence directly,
-without the manual gradient arithmetic below.  History across rounds can be
-injected by sub-classing and overriding compute_update.
+A RL policy would receive the AptamerState (with full history) and output a
+sequence directly, without the manual gradient arithmetic below.
 """
 
 import random
 import numpy as np
 from typing import List, Optional
+
+from .env import AptamerState
 
 NUCLEOTIDES = ['A', 'C', 'G', 'T']
 NT_TO_INT   = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
@@ -74,7 +75,7 @@ class SPSAUpdater:
 
     def compute_update(
         self,
-        current_seq: str,
+        state: AptamerState,
         candidates: List[str],
         candidate_scores: np.ndarray,
         current_score: float,
@@ -84,15 +85,17 @@ class SPSAUpdater:
 
         Parameters
         ----------
-        current_seq      : current aptamer sequence
+        state            : AptamerState with sliding-window history; state.current_seq
+                           is the sequence to update from
         candidates       : list of dumb-perturbation sequences (length NumInternalReps)
         candidate_scores : effective score per candidate (same length as candidates)
-        current_score    : effective score of current_seq
+        current_score    : effective score of state.current_seq
 
         Returns
         -------
         str : new candidate sequence (the 'smart update')
         """
+        current_seq = state.current_seq
         L         = len(current_seq)
         non_fixed = [i for i in range(L) if i not in self.fixed_positions]
         grad      = np.zeros((4, L), dtype=float)

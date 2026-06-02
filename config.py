@@ -32,6 +32,7 @@ def get_6mer_config(
     max_iterations: int = 60,
     output_csv: str = 'evolution_data_6mer.csv',
     cache_path: str = '/data/alibd/Code/digitalSELEX-2/python_spsa_optimizer/cache_6mer_gpu.pkl',
+    history_length: int = 5,
 ) -> OptimizerConfig:
     return OptimizerConfig(
         initial_sequence=initial_seq,
@@ -48,6 +49,7 @@ def get_6mer_config(
         docker_name='autodockgpu',
         output_csv=output_csv,
         cache_path=cache_path,
+        history_length=history_length,
     )
 
 
@@ -57,6 +59,7 @@ def get_7mer_config(
     max_iterations: int = 60,
     output_csv: str = 'evolution_data_7mer.csv',
     cache_path: str = '/data/alibd/Code/digitalSELEX-2/python_spsa_optimizer/cache_7mer_gpu.pkl',
+    history_length: int = 5,
 ) -> OptimizerConfig:
     return OptimizerConfig(
         initial_sequence=initial_seq,
@@ -73,4 +76,5 @@ def get_7mer_config(
         docker_name='autodockgpu',
         output_csv=output_csv,
         cache_path=cache_path,
+        history_length=history_length,
     )

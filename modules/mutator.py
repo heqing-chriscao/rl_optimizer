@@ -6,13 +6,15 @@ NN REPLACEMENT POINT
 --------------------
 Replace `RandomMutator.generate_candidates` with a learned generator.
 The interface is:
-    generate_candidates(sequence: str, n_variants: int) -> List[str]
-The NN receives the current sequence (and optionally history/scores) and proposes
-n_variants candidate sequences to explore in the next round.
+    generate_candidates(state: AptamerState, n_variants: int) -> List[str]
+The NN receives the full AptamerState (sliding-window history of (seq, rank) pairs)
+and proposes n_variants candidate sequences to explore in the next round.
 """
 
 import random
 from typing import List, Optional
+
+from .env import AptamerState
 
 NUCLEOTIDES = ['A', 'C', 'G', 'T']
 NT_TO_INT   = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
@@ -55,14 +57,14 @@ class RandomMutator:
         self.fixed_positions   = set(fixed_positions or [])
         self.less_than_or_equal = less_than_or_equal
 
-    def generate_candidates(self, sequence: str, n_variants: int) -> List[str]:
+    def generate_candidates(self, state: AptamerState, n_variants: int) -> List[str]:
         """
-        Generate n_variants mutated sequences from `sequence`.
+        Generate n_variants mutated sequences from state.current_seq.
 
         Parameters
         ----------
-        sequence : str
-            Current aptamer (e.g. 'CACCCT').
+        state : AptamerState
+            Sliding-window history; state.current_seq is the sequence to mutate from.
         n_variants : int
             Number of candidates to produce.
 
@@ -70,6 +72,7 @@ class RandomMutator:
         -------
         List[str] of length n_variants.
         """
+        sequence = state.current_seq
         non_fixed = [i for i in range(len(sequence)) if i not in self.fixed_positions]
         max_mut = min(self.max_mutation_rate, len(non_fixed))
 
