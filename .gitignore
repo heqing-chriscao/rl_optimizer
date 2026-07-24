@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 *.pkl
 evolution_data*.csv
+
+supervised/*.npz
